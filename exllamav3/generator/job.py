@@ -265,6 +265,7 @@ class Job:
         self._init_banned_strings(banned_strings)
 
         self.checkpoint = None
+        self.hot_seeded = False
         self.checkpoint_rewound = False
 
         # Metrics

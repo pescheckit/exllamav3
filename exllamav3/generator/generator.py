@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import torch
 import os
 from ..model.model import Model
@@ -17,6 +18,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
+from .mtp_hot_head import MTPHotHead
 from ..model.moe_cpu_host import set_moe_cpu_hot
 from ..modules.block_sparse_mlp_cpu import promote_tick
 from .job import Job
@@ -459,6 +461,19 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+
+        self.mtp_hot_head = None
+        self._hot_drafted = False
+        hot_rows = int(os.environ.get("EXL3_MTP_HOT_HEAD", "0"))
+        if self.mtp_draft and hot_rows > 0:
+            self.mtp_hot_head = MTPHotHead(
+                model,
+                self.draft_model.output_device,
+                hot_rows,
+                stats_path = os.environ.get("EXL3_MTP_HOT_HEAD_STATS") or None,
+                min_tokens = int(os.environ.get("EXL3_MTP_HOT_HEAD_MIN_TOKENS", "20000")),
+                rebuild_every = int(os.environ.get("EXL3_MTP_HOT_HEAD_REBUILD", "8192")),
+            )
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -1334,6 +1349,14 @@ class Generator:
             kv_seqlens = cache_seqlens.clone()
             target_states = [job.recurrent_state.target for job in self.active_jobs if job.is_prefill_done()] \
                 if self.target_recurrent else None
+        hot = self.mtp_hot_head if self.mtp_hot_head is not None and self.mtp_hot_head.ready else None
+        self._hot_drafted = hot is not None
+        if hot is not None:
+            for job in self.active_jobs:
+                if job.is_prefill_done() and not job.hot_seeded:
+                    hot.add_sequence(job.sequences[0].sequence_ids.torch())
+                    job.hot_seeded = True
+            hot.apply_inserts()
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -1353,9 +1376,12 @@ class Generator:
             if draft_emb is not None:
                 params["draft_embedding"] = draft_emb
             batch_state = self.draft_model.forward(batch_ids, params)
-            lm_head = self.model.modules[self.model.logit_layer_idx]
-            batch_state = lm_head.prepare_for_device(batch_state, params)
-            new_ids = self.draft_model.sample_from_state(batch_state, params)
+            if hot is not None:
+                new_ids = hot.argmax(batch_state, params)
+            else:
+                lm_head = self.model.modules[self.model.logit_layer_idx]
+                batch_state = lm_head.prepare_for_device(batch_state, params)
+                new_ids = self.draft_model.sample_from_state(batch_state, params)
             draft_cols.append(new_ids)
             draft_emb = params.get("draft_embedding")
             # Without a row from the sparse head, the next step looks the token up in the embedding table,
@@ -2083,6 +2109,8 @@ class Generator:
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_stash_boundary()
                         if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                            if self._hot_drafted and not cp_boundary:
+                                self.mtp_hot_head.note_reject(sampled_token.item())
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
@@ -2131,6 +2159,11 @@ class Generator:
 
                 # The last sampled token leads the next forward
                 self.model.prefetch_tokens([sampled_token.item()])
+
+                if self.mtp_hot_head is not None and draft_tokens is not None:
+                    seq_ids = job.sequences[0].sequence_ids
+                    n = len(seq_ids)
+                    self.mtp_hot_head.observe(seq_ids.torch_slice(n - accepted_length, n))
 
                 accepted_lengths.append(accepted_length)
                 j += 1
