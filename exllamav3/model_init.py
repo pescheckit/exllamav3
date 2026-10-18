@@ -136,6 +136,7 @@ def add_args(
         parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
         parser.add_argument("-sdh", "--sparse_draft_head", type = int, default = 0, help = "Draft through a dynamic sparse LM head of this many vocabulary columns (MTP/DFlash drafting; 0 = full head)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
+        parser.add_argument("-mhh", "--mtp_hot_head", type = int, help = "MTP drafting: rows in a draft-only LM head that learns the generated tokens, 0 disables (default: EXL3_MTP_HOT_HEAD, else off)", default = None)
         parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
 
 
