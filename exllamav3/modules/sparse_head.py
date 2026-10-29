@@ -44,6 +44,7 @@ _MIN_SAVE_TOKENS = 64       # a session shorter than this leaves the saved profi
 _MISS_EMA_TOKENS = 512      # time constant of the attributable miss rate, in target tokens
 _ROUND_EMA = 0.05           # weight of a new round in the round-time average
 RECONSTRUCT_SLICE_N = 32768
+_LOG = bool(os.environ.get("EXL3_SPARSE_HEAD_LOG"))
 
 
 def token_stats_path(model_dir: str, vocab_size: int) -> str:
@@ -497,6 +498,8 @@ class SparseHead:
             self.t_sparse = timed(lambda: self.argmax(x))
         finally:
             self.n_active = n_active
+        if _LOG:
+            print(f" -- sparse draft head: full {self.t_full * 1e3:.3f} ms, sparse {self.t_sparse * 1e3:.3f} ms per call")
 
 
     def note_round(self, seconds: float, drafted: int, head_calls: int):
@@ -526,12 +529,16 @@ class SparseHead:
         m_star = self.breakeven_miss_rate
         if m_star is None:
             return
+        was = self.mode_sparse
         if self.mode_sparse and self.miss_rate > 1.25 * m_star:
             self.mode_sparse = False
             self.mode_switches += 1
         elif not self.mode_sparse and self.miss_rate < 0.8 * m_star:
             self.mode_sparse = True
             self.mode_switches += 1
+        if _LOG and (self.mode_sparse != was or self.rebuilds % 64 == 1):
+            print(f" -- sparse draft head: miss rate {self.miss_rate:.2%}, break-even {m_star:.2%}, "
+                  f"{self.n_active} columns, {'sparse' if self.mode_sparse else 'full head'}")
 
 
     def round_flag(self):
