@@ -31,6 +31,8 @@ import math
 import time
 import torch
 from ..ext import exllamav3_ext as ext
+from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
+from ..util.pinned_arena import PinnedArena
 
 # Directory of the saved token frequency profiles; None = <user cache dir>/exllamav3/token_stats
 # (the test suite points it at a scratch directory so runs neither read nor leave profiles)
@@ -41,6 +43,7 @@ _SAVE_INTERVAL = 4096       # observed generated tokens between profile writes
 _MIN_SAVE_TOKENS = 64       # a session shorter than this leaves the saved profile alone
 _MISS_EMA_TOKENS = 512      # time constant of the attributable miss rate, in target tokens
 _ROUND_EMA = 0.05           # weight of a new round in the round-time average
+RECONSTRUCT_SLICE_N = 32768
 
 
 def token_stats_path(model_dir: str, vocab_size: int) -> str:
@@ -61,6 +64,78 @@ def token_stats_path(model_dir: str, vocab_size: int) -> str:
         cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
         root = os.path.join(cache, "exllamav3", "token_stats")
     return os.path.join(root, key + ".pt")
+
+
+def _unpack_signs(bitfield: torch.Tensor) -> torch.Tensor:
+    bits = bitfield.view(torch.uint16).to(torch.int)
+    masks = 1 << torch.arange(16, device = bits.device)
+    expanded = ((bits.unsqueeze(-1) & masks) > 0).flatten()
+    return (1.0 - expanded.to(torch.half) * 2.0).contiguous()
+
+
+@torch.inference_mode
+def reconstruct_head(stc, key: str, store: torch.Tensor, device: torch.device):
+    vocab, hidden = store.shape
+    if not stc.has_tensor(key + ".trellis"):
+        store.copy_(stc.get_tensor(key + ".weight", "cpu", allow_bf16 = True)[:vocab].to(store.dtype))
+        return
+
+    trellis = stc.get_tensor(key + ".trellis", "cpu")
+    def signs(name):
+        if stc.has_tensor(key + "." + name + "h"):
+            return stc.get_tensor(key + "." + name + "h", device)
+        return _unpack_signs(stc.get_tensor(key + "." + name, device))
+    suh, svh = signs("su"), signs("sv")
+    mcg = stc.get_codebook_marker(key + ".mcg", codebook_mcg_mult) is not None
+    mul1 = stc.get_codebook_marker(key + ".mul1", codebook_mul1_mult) is not None
+    K = trellis.shape[-1] / 16
+    n_total = min(trellis.shape[1] * 16, (vocab + 127) // 128 * 128)
+
+    # One slice of packed columns at a time, so the full head never has to sit on the device
+    tiles_k, words = trellis.shape[0], trellis.shape[-1]
+    p_buf = torch.empty(tiles_k * (RECONSTRUCT_SLICE_N // 16) * words, dtype = torch.short, device = device)
+    w_buf = torch.empty(hidden * RECONSTRUCT_SLICE_N, dtype = torch.half, device = device)
+    wt_buf = torch.empty(hidden * RECONSTRUCT_SLICE_N, dtype = torch.half, device = device)
+    stream = torch.cuda.current_stream(device)
+    for n0 in range(0, n_total, RECONSTRUCT_SLICE_N):
+        n = min(RECONSTRUCT_SLICE_N, n_total - n0)
+        p = p_buf[:tiles_k * (n // 16) * words].view(tiles_k, n // 16, words)
+        p.copy_(trellis[:, n0 // 16 : (n0 + n) // 16])
+        w = w_buf[:hidden * n].view(hidden, n)
+        ext.reconstruct_had_slice(w, p, suh, svh[n0:n0 + n], K, mcg, mul1, 0)
+        wt = wt_buf[:hidden * n].view(n, hidden)
+        wt.copy_(w.t())
+        m = min(n0 + n, vocab) - n0
+        store[n0:n0 + m].copy_(wt[:m], non_blocking = True)
+        stream.synchronize()
+
+class HostColumns:
+    """
+    Column source for a SparseHead when the LM head is not loaded in this process (tensor parallel, where it is
+    sharded across the workers): the head is rebuilt dense from the checkpoint once into pinned host memory,
+    and installed columns are copied from there to the head's device
+    """
+
+    def __init__(self, head, config, device: torch.device):
+        self.key = head.key
+        self.config = config
+        self.device = torch.device(device)
+        self.in_features = head.in_features
+        self.pre_scale, self.softcap, self.post_scale = head.pre_scale, head.softcap, head.post_scale
+        self.inner = self
+        self.store = None
+
+
+    def reconstruct_columns(self, cols: torch.Tensor, out: torch.Tensor):
+        if self.store is None:
+            vocab = self.config.vocab_size
+            nbytes = vocab * self.in_features * 2
+            arena = PinnedArena(nbytes, "sparse head row store")
+            self.store = arena.tensor[:nbytes].view(torch.half).view(vocab, self.in_features)
+            self.store._arena = arena
+            reconstruct_head(self.config.stc, self.key, self.store, self.device)
+            torch.cuda.empty_cache()
+        out.copy_(self.store[cols.cpu()].t().to(self.device))
 
 
 class SparseHead:
@@ -394,11 +469,16 @@ class SparseHead:
 
     # Cost model
 
-    def benchmark(self, iters: int = 20):
-        """Time one full-head and one sparse argmax at batch size 1 on the head's device"""
+    def benchmark(self, iters: int = 20, full_argmax = None):
+        """
+        Time one full-head and one sparse argmax at batch size 1 on the head's device. full_argmax replaces the
+        local full head, for a head that runs elsewhere (Model.lm_head_argmax under tensor parallel)
+        """
         lin = self.linear
         x = torch.randn((1, 1, self.k), dtype = torch.half, device = self.device)
         def full():
+            if full_argmax is not None:
+                return full_argmax(x)
             logits = lin.forward(x, {})
             return torch.argmax(logits, dim = -1)
         def timed(fn):

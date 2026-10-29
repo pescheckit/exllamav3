@@ -400,23 +400,28 @@ class Model(Model_TPMixin, Model_LSMixin):
         padding column can never win.
         """
         export = bool(params.get("export_draft_conf"))
-        if self.loaded_tp:
-            state = self.tp_producer.send(state)
-            ids, conf = self.tp_dispatch_lm_head_argmax((state, {}), return_max = True)
-            if export:
-                params["draft_conf"] = conf
-            return ids
         lm = self.modules[self.logit_layer_idx]
         # Draft-only sparse subset of the vocabulary, selected by the caller through params so the
-        # verification forward can never take it
+        # verification forward can never take it. Under tensor parallel it lives on the drafter's device in
+        # this process (HostColumns), not in the workers that hold the sharded head
         sh = lm.sparse_head
         flag = params.get("sparse_head") if sh is not None else None
         if flag is True and sh.ready:
-            ids, conf, emb = sh.argmax(lm.prepare_for_device(state, params), embedding = True)
+            x = state.to(sh.device) if self.loaded_tp else lm.prepare_for_device(state, params)
+            ids, conf, emb = sh.argmax(x, embedding = True)
             if export:
                 params["draft_conf"] = conf
             if emb is not None:
                 params["draft_embedding"] = emb
+            return ids
+        if self.loaded_tp:
+            sent = self.tp_producer.send(state)
+            ids, conf = self.tp_dispatch_lm_head_argmax((sent, {}), return_max = True)
+            if flag == "probe":
+                sparse_ids, _ = sh.argmax(state.to(sh.device))
+                sh.record_probe(ids.to(sh.device), sparse_ids)
+            if export:
+                params["draft_conf"] = conf
             return ids
         logits = lm.forward(lm.prepare_for_device(state, params), params)
         logits = logits[..., :self.config.vocab_size]

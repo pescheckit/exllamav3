@@ -454,22 +454,39 @@ class Generator:
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
 
-        # Sparse drafting head over a frequency-selected vocabulary subset (layer-split mode only)
+        # Sparse drafting head over a frequency-selected vocabulary subset
         self.sparse_head = None
         self._sparse_flag = False
-        if sparse_draft_head and self.draft_model is not None and not model.loaded_tp:
-            from ..modules.sparse_head import token_stats_path
-            # Drafters with a head of their own (Gemma4 assistant) take the subset there; the others borrow the
-            # target's head and the subset mirrors it
+        if sparse_draft_head and self.draft_model is not None:
+            from ..modules.sparse_head import token_stats_path, SparseHead, HostColumns
+            profile_path = token_stats_path(model.config.directory, model.config.vocab_size)
+            embedding = model.modules[0] if self.mtp_draft else None
+            full_argmax = None
             own = getattr(self.draft_model, "sparse_head_linear", None)
-            lm = own() if own is not None else model.modules[model.logit_layer_idx]
-            self.sparse_head = lm.make_sparse_head(
-                sparse_draft_head,
-                model.config.vocab_size,
-                profile_path = token_stats_path(model.config.directory, model.config.vocab_size),
-                embedding = model.modules[0] if self.mtp_draft else None,
-            )
-            self.sparse_head.benchmark()
+            if model.loaded_tp and own is None:
+                # The target's head is sharded across the workers: mirror its columns from the checkpoint on
+                # the drafter's device instead, and time the full head through the TP dispatch
+                lm = model.modules[model.logit_layer_idx]
+                lm.sparse_head = SparseHead(
+                    HostColumns(lm, model.config, self.draft_model.output_device),
+                    sparse_draft_head,
+                    model.config.vocab_size,
+                    profile_path = profile_path,
+                )
+                self.sparse_head = lm.sparse_head
+                full_argmax = lambda x: model.lm_head_argmax(x, {})
+            elif not model.loaded_tp:
+                # Drafters with a head of their own (Gemma4 assistant) take the subset there; the others borrow
+                # the target's head and the subset mirrors it
+                lm = own() if own is not None else model.modules[model.logit_layer_idx]
+                self.sparse_head = lm.make_sparse_head(
+                    sparse_draft_head,
+                    model.config.vocab_size,
+                    profile_path = profile_path,
+                    embedding = embedding,
+                )
+            if self.sparse_head is not None:
+                self.sparse_head.benchmark(full_argmax = full_argmax)
 
 
     def num_remaining_jobs(self):
