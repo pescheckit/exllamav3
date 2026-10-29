@@ -455,6 +455,8 @@ class Generator:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
 
         # Sparse drafting head over a frequency-selected vocabulary subset
+        if not sparse_draft_head:
+            sparse_draft_head = int(os.environ.get("EXL3_SPARSE_DRAFT_HEAD", 0))
         self.sparse_head = None
         self._sparse_flag = False
         if sparse_draft_head and self.draft_model is not None:
