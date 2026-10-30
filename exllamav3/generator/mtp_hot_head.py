@@ -11,7 +11,8 @@ from ..ext import exllamav3_ext as ext
 from ..modules.quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..util.pinned_arena import PinnedArena
 
-RECONSTRUCT_SLICE_N = 32768
+# ~100MB of device scratch at hidden 5120; the rebuild runs next to a full KV pool
+RECONSTRUCT_SLICE_N = 4096
 REBUILD_EVERY = 8192         # counted tokens between refreshes; also the coverage window
 OVERDUE_REBUILDS = 4         # refresh inline once this many are pending without the queue draining
 DECAY = 0.97                 # per refresh, a half-life of ~23 refreshes (~190k tokens)
@@ -326,18 +327,24 @@ class MTPHotHead:
 
     @torch.inference_mode
     def _activate(self):
-        self.store = self.load_store()
-        pin = self.device.type == "cuda"
-        self.table = torch.zeros((self.rows, self.hidden), dtype = self.dtype, device = self.device)
-        self.ids = torch.zeros(self.rows, dtype = torch.long, device = self.device)
-        # Unfilled slots must never win the argmax
-        self.bias = torch.full((1, self.rows), torch.finfo(self.dtype).min, dtype = self.dtype, device = self.device)
-        self.staging = torch.empty((self.rows, self.hidden), dtype = self.dtype, pin_memory = pin)
-        self.insert_staging = torch.empty((self.seq_rows, self.hidden), dtype = self.dtype, pin_memory = pin)
-        held = np.flatnonzero(self.slot_ids >= 0)
-        self._upload(held, self.slot_ids[held], self.staging, "_staging_free")
-        self.insert_slots.clear()
-        self.insert_ids.clear()
+        try:
+            self.store = self.load_store()
+            pin = self.device.type == "cuda"
+            self.table = torch.zeros((self.rows, self.hidden), dtype = self.dtype, device = self.device)
+            self.ids = torch.zeros(self.rows, dtype = torch.long, device = self.device)
+            # Unfilled slots must never win the argmax
+            self.bias = torch.full((1, self.rows), torch.finfo(self.dtype).min, dtype = self.dtype, device = self.device)
+            self.staging = torch.empty((self.rows, self.hidden), dtype = self.dtype, pin_memory = pin)
+            self.insert_staging = torch.empty((self.seq_rows, self.hidden), dtype = self.dtype, pin_memory = pin)
+            held = np.flatnonzero(self.slot_ids >= 0)
+            self._upload(held, self.slot_ids[held], self.staging, "_staging_free")
+            self.insert_slots.clear()
+            self.insert_ids.clear()
+        except torch.OutOfMemoryError:
+            # Raising here would fail the job that triggered the refresh and wedge the generator
+            self._deactivate()
+            print(" !! MTP hot head: out of memory while activating, retrying at the next refresh")
+            return
         self.active = True
 
 
