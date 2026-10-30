@@ -43,7 +43,8 @@ _SAVE_INTERVAL = 4096       # observed generated tokens between profile writes
 _MIN_SAVE_TOKENS = 64       # a session shorter than this leaves the saved profile alone
 _MISS_EMA_TOKENS = 512      # time constant of the attributable miss rate, in target tokens
 _ROUND_EMA = 0.05           # weight of a new round in the round-time average
-RECONSTRUCT_SLICE_N = 32768
+# ~100MB of device scratch at hidden 5120; the rebuild runs next to a full KV pool
+RECONSTRUCT_SLICE_N = 4096
 _LOG = bool(os.environ.get("EXL3_SPARSE_HEAD_LOG"))
 
 
