@@ -1,3 +1,23 @@
+## About this fork
+
+This is Pescheck's fork of [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3). It builds the inference engine behind our office LLM box (2x RTX 3090, tensor parallel, served through TabbyAPI and LiteLLM). The deployment itself lives in an internal repo that pins a commit from this fork.
+
+We keep a fork because we run a few changes that upstream does not have (yet), and the box needs a stable, fetchable commit to compile from:
+
+- **MTP hot head**: a small draft head that learns which tokens the model actually emits and drafts from those, so speculative decoding runs faster on our traffic. Switched on with `mtp_hot_head_rows`.
+- **Two-rank P2P all-reduce** (`EXL3_TP_P2P=1`): replaces the NCCL all-reduce between the two GPUs with a one-shot peer-to-peer copy, fused with the residual add and norm. It cuts per-token latency under tensor parallel.
+- **Sparse draft head under TP**: upstream's sparse draft head made to work with tensor parallel. Off unless `EXL3_SPARSE_DRAFT_HEAD` is set.
+
+### Branches
+
+- `dev` tracks upstream `dev` plus our commits, rebased when we sync.
+- `tp-sparse-head` is `dev` plus the sparse head port. This is what production builds from.
+- `master` mirrors upstream `master` and carries nothing of ours.
+
+Fixes that make sense upstream go there as separate PRs. Once upstream has an equivalent, we drop our commit at the next sync.
+
+---
+
 
 <p align="center">
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
